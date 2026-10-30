@@ -67,12 +67,14 @@ class PazEntry:
 _MAX_SANE_PAZ_COUNT = 4096
 
 
-def parse_pamt(pamt_path: str, paz_dir: str = None) -> list[PazEntry]:
+def parse_pamt(pamt_path: str, paz_dir: str = None, *,
+               full_paths: bool = False) -> list[PazEntry]:
     """Parse a .pamt index file and return all file entries.
 
     Args:
         pamt_path: path to the .pamt file
         paz_dir: directory containing .paz files (default: same dir as .pamt)
+        full_paths: resolve folder records instead of the historical root prefix
 
     Returns:
         list of PazEntry
@@ -84,7 +86,7 @@ def parse_pamt(pamt_path: str, paz_dir: str = None) -> list[PazEntry]:
             shipped the corrupt archive.
     """
     try:
-        return _parse_pamt_impl(pamt_path, paz_dir)
+        return _parse_pamt_impl(pamt_path, paz_dir, full_paths=full_paths)
     except ValueError as e:
         if str(e).startswith(f"Corrupt PAMT {os.path.basename(pamt_path)}:"):
             raise
@@ -147,7 +149,8 @@ def _read_name_tree(data: bytes, start: int, end: int, compact: bool) -> dict:
     return nodes
 
 
-def _parse_pamt_impl(pamt_path: str, paz_dir: str = None) -> list[PazEntry]:
+def _parse_pamt_impl(pamt_path: str, paz_dir: str = None, *,
+                     full_paths: bool = False) -> list[PazEntry]:
     with open(pamt_path, 'rb') as f:
         data = f.read()
 
@@ -211,33 +214,44 @@ def _parse_pamt_impl(pamt_path: str, paz_dir: str = None) -> list[PazEntry]:
     nodes = _read_name_tree(data, node_start, node_start + node_size, compact)
     off = node_start + node_size
 
-    def build_path(node_ref):
+    def build_path(tree, node_ref):
         parts = []
         cur = node_ref
         while cur != 0xFFFFFFFF and len(parts) < 64:
-            if cur not in nodes:
-                raise ValueError('Corrupt PAMT: invalid filename tree reference')
-            p, n = nodes[cur]
+            if cur not in tree:
+                if compact:
+                    raise ValueError('Corrupt PAMT: invalid name tree reference')
+                break  # Preserve legacy handling of incomplete name trees.
+            p, n = tree[cur]
             parts.append(n)
             cur = p
-        if cur != 0xFFFFFFFF:
-            raise ValueError('Corrupt PAMT: cyclic or excessively deep filename tree')
+        if compact and cur != 0xFFFFFFFF:
+            raise ValueError('Corrupt PAMT: cyclic or excessively deep name tree')
         return ''.join(reversed(parts))
 
     # Folder record section
     folder_count = struct.unpack_from('<I', data, off)[0]; off += 4
+    folder_records_start = off
     off += folder_count * 16  # skip folder records (16 bytes each)
     # 2.04 emits only its empty extension table for an empty archive: the
     # zero file-count field is omitted. Legacy empty indexes keep that field.
-    if not paz_count and not folder_size and not node_size and not folder_count:
-        if data[off:] == b'\x01\x00\x00\x00\x00':
-            return []
+    if (not paz_count and not folder_size and not node_size and not folder_count
+            and data[off:] == b'\x01\x00\x00\x00\x00'):
+        return []
     _bounds_check(pamt_path, 'folder records', off + 4, len(data))
 
     # File record section
     file_count = struct.unpack_from('<I', data, off)[0]; off += 4
     records_end = off + file_count * 20
     _bounds_check(pamt_path, 'file records', records_end, len(data))
+    file_folders = {}
+    if full_paths:
+        for pos in range(folder_records_start, folder_records_start + folder_count * 16, 16):
+            _, folder_ref, first, count = struct.unpack_from('<IIII', data, pos)
+            _bounds_check(pamt_path, 'folder file range', first + count, file_count)
+            folder_path = build_path(folders, folder_ref).strip('/')
+            for index in range(first, first + count):
+                file_folders[index] = folder_path
     extensions = []
     if compact:
         _bounds_check(pamt_path, 'extension size', records_end + 4, len(data))
@@ -262,13 +276,14 @@ def _parse_pamt_impl(pamt_path: str, paz_dir: str = None) -> list[PazEntry]:
         # Masking with 0xFF truncated indices above 255, so dirs with
         # more than 256 PAZ files resolved entries to the wrong archive.
         paz_index = flags & 0xFFFF
-        node_path = build_path(node_ref)
+        node_path = build_path(nodes, node_ref)
         if compact:
             extension_id = flags >> 24
             if extension_id >= len(extensions):
                 raise ValueError('Corrupt PAMT: invalid extension index')
             node_path += extensions[extension_id]
-        full_path = f"{folder_prefix}/{node_path}" if folder_prefix else node_path
+        prefix = file_folders.get(_entry_count, '') if full_paths else folder_prefix
+        full_path = f"{prefix}/{node_path}" if prefix else node_path
 
         paz_num = int(pamt_stem) + paz_index
         paz_file = os.path.join(paz_dir, f"{paz_num}.paz")
